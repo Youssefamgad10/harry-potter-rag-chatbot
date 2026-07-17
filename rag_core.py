@@ -1,53 +1,21 @@
-import pdfplumber
-import re
+import pickle
 import numpy as np
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from fastembed import TextEmbedding
 import faiss
 from rank_bm25 import BM25Okapi
+from fastembed import TextEmbedding
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
 
-def build_pipeline(pdf_path="harrypotter pdf.pdf"):
-    pages_text = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                pages_text.append(text)
+_embed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
-    def clean_text(text):
-        text = re.sub(r"\s+", " ", text)
-        text = re.sub(r"Page \d+", "", text)
-        text = re.sub(r"[^\x00-\x7F]+", " ", text)
-        return text.strip()
+def build_pipeline(index_path="book_index.faiss", data_path="book_data.pkl"):
+    index = faiss.read_index(index_path)
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=75,
-        separators=["\n\n", "\n", ". ", " ", ""]
-    )
-
-    all_chunks = []
-    all_metadatas = []
-
-    for page_num, page_text in enumerate(pages_text):
-        page_clean = clean_text(page_text)
-        if not page_clean.strip():
-            continue
-        page_chunks = splitter.split_text(page_clean)
-        for chunk in page_chunks:
-            all_chunks.append(chunk)
-            all_metadatas.append({"page": page_num + 1})
-
-    embed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
-    embeddings = list(embed_model.embed(all_chunks))
-    embedding_matrix = np.array(embeddings).astype("float32")
-
-    dimension = embedding_matrix.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embedding_matrix)
+    with open(data_path, "rb") as f:
+        data = pickle.load(f)
+    all_chunks = data["chunks"]
+    all_metadatas = data["metadatas"]
 
     tokenized_chunks = [c.lower().split() for c in all_chunks]
     bm25 = BM25Okapi(tokenized_chunks)
@@ -61,7 +29,6 @@ def build_pipeline(pdf_path="harrypotter pdf.pdf"):
     return {
         "all_chunks": all_chunks,
         "all_metadatas": all_metadatas,
-        "embed_model": embed_model,
         "index": index,
         "bm25": bm25,
         "client": client,
@@ -71,11 +38,10 @@ def build_pipeline(pdf_path="harrypotter pdf.pdf"):
 def hybrid_search(pipeline, question, n_results=8, bm25_weight=0.5):
     all_chunks = pipeline["all_chunks"]
     all_metadatas = pipeline["all_metadatas"]
-    embed_model = pipeline["embed_model"]
     index = pipeline["index"]
     bm25 = pipeline["bm25"]
 
-    q_embedding = np.array(list(embed_model.embed([question]))).astype("float32")
+    q_embedding = np.array(list(_embed_model.embed([question]))).astype("float32")
     distances, indices = index.search(q_embedding, n_results * 2)
 
     tokenized_q = question.lower().split()
@@ -140,4 +106,4 @@ Cite the page number(s) you used."""
         ],
         temperature=0
     )
-    return response.choices[0].message.content, context_chunks
+    return response.choices[0].message.content, context_chunks_sorted
