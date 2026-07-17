@@ -1,0 +1,9 @@
+streamlit
+pdfplumber
+langchain-text-splitters
+fastembed
+faiss-cpu
+rank_bm25
+openai
+numpy
+python-dotenv
