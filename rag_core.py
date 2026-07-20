@@ -1,21 +1,79 @@
-import pickle
+﻿import pickle
+import re
 import numpy as np
 import faiss
+import pdfplumber
 from rank_bm25 import BM25Okapi
 from fastembed import TextEmbedding
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
 
 _embed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
+
 def build_pipeline(index_path="book_index.faiss", data_path="book_data.pkl"):
+    """Loads the pre-built index for the default book (Harry Potter)."""
     index = faiss.read_index(index_path)
 
     with open(data_path, "rb") as f:
         data = pickle.load(f)
     all_chunks = data["chunks"]
     all_metadatas = data["metadatas"]
+
+    tokenized_chunks = [c.lower().split() for c in all_chunks]
+    bm25 = BM25Okapi(tokenized_chunks)
+
+    load_dotenv()
+    client = OpenAI(
+        api_key=os.getenv("GROQ_API_KEY"),
+        base_url="https://api.groq.com/openai/v1"
+    )
+
+    return {
+        "all_chunks": all_chunks,
+        "all_metadatas": all_metadatas,
+        "index": index,
+        "bm25": bm25,
+        "client": client,
+    }
+
+
+def _clean_text(text):
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"Page \d+", "", text)
+    text = re.sub(r"[^\x00-\x7F]+", " ", text)
+    return text.strip()
+
+
+def build_pipeline_from_pdf(pdf_path):
+    """Builds a pipeline on the fly from ANY uploaded PDF (no pre-built index needed)."""
+    pages_text = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if text:
+                pages_text.append(text)
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500, chunk_overlap=75,
+        separators=["\n\n", "\n", ". ", " ", ""]
+    )
+
+    all_chunks, all_metadatas = [], []
+    for page_num, page_text in enumerate(pages_text):
+        page_clean = _clean_text(page_text)
+        if not page_clean.strip():
+            continue
+        for chunk in splitter.split_text(page_clean):
+            all_chunks.append(chunk)
+            all_metadatas.append({"page": page_num + 1})
+
+    embeddings = list(_embed_model.embed(all_chunks))
+    embedding_matrix = np.array(embeddings).astype("float32")
+    index = faiss.IndexFlatL2(embedding_matrix.shape[1])
+    index.add(embedding_matrix)
 
     tokenized_chunks = [c.lower().split() for c in all_chunks]
     bm25 = BM25Okapi(tokenized_chunks)
@@ -60,29 +118,12 @@ def hybrid_search(pipeline, question, n_results=8, bm25_weight=0.5):
     return [{"chunk": all_chunks[idx], "page": all_metadatas[idx]["page"], "score": score} for idx, score in ranked]
 
 
-def expand_query(question):
-    aliases = {
-        "harry's uncle": "Mr. Dursley Uncle Vernon Grunnings drills",
-        "harry's aunt": "Mrs. Dursley Aunt Petunia",
-        "harry's school": "Hogwarts",
-        "harry's best friend": "Ron Weasley Hermione Granger",
-        "harry's house": "Sorting Hat Gryffindor sorted",
-        "harry sorted into": "Sorting Hat Gryffindor ceremony sorted",
-    }
-    expanded = question
-    for phrase, exp in aliases.items():
-        if phrase.lower() in question.lower():
-            expanded += " " + exp
-    return expanded
-
-
 def ask_question(pipeline, question, n_results=8):
     all_chunks = pipeline["all_chunks"]
     all_metadatas = pipeline["all_metadatas"]
     client = pipeline["client"]
 
-    expanded_q = expand_query(question)
-    context_chunks = hybrid_search(pipeline, expanded_q, n_results=n_results)
+    context_chunks = hybrid_search(pipeline, question, n_results=n_results)
 
     existing = {c["chunk"] for c in context_chunks}
     for idx in range(3):
@@ -95,8 +136,8 @@ def ask_question(pipeline, question, n_results=8):
     system_prompt = """You are answering questions about a book using only the provided excerpts.
 Read ALL excerpts carefully before answering. Excerpts are presented in page order (chronological order in the book).
 If events change or outcomes are revealed later in the excerpts, the LATER page's information is the final/correct outcome.
-If the excerpts don't contain the answer, say so.
-Cite the page number(s) you used."""
+Answer in exactly ONE concise sentence. Include a page citation in parentheses at the end, like (Page 42).
+If the excerpts don't contain the answer, say so in one sentence."""
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
